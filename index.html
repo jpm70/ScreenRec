@@ -715,13 +715,16 @@ async function initCamera() {
   const facing = settings.camera || 'environment';
   log('Iniciando cámara: ' + facing, 'ok');
 
-  // Intentos en orden — siempre con el facingMode correcto, nunca caer a "video:true" sin él
+  // Detectar orientación de pantalla para pedir resolución correcta
+  const isPortrait = window.innerHeight >= window.innerWidth;
+  const w = isPortrait ? 720 : 1280;
+  const h = isPortrait ? 1280 : 720;
+
   const attempts = [
-    { video: { facingMode: { exact: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: true },
+    { video: { facingMode: { exact: facing }, width: { ideal: w }, height: { ideal: h } }, audio: true },
     { video: { facingMode: { exact: facing } }, audio: true },
     { video: { facingMode: facing }, audio: true },
     { video: { facingMode: facing }, audio: false },
-    // Último recurso sin facing — puede usar cualquier cámara
     { video: true, audio: true },
     { video: true, audio: false },
   ];
@@ -754,9 +757,50 @@ async function initCamera() {
   const video = document.getElementById('camera-stream');
   video.srcObject = stream;
   await video.play();
+
+  // Corregir orientación si el sensor devuelve el vídeo rotado
+  fixVideoOrientation(stream);
+
   document.getElementById('camStatus').textContent = 'Lista ✓ (' + facing + ')';
   document.getElementById('statusDot').classList.add('active');
   log('Cámara lista', 'ok');
+}
+
+function fixVideoOrientation(stream) {
+  const video = document.getElementById('camera-stream');
+  const track = stream.getVideoTracks()[0];
+  if (!track) return;
+
+  const settings = track.getSettings?.() || {};
+  const rotation = settings.facingMode; // no tiene rotation directo
+
+  // En Android, getSettings() puede tener 'width' > 'height' aunque se vea vertical
+  // Si el vídeo es más ancho que alto pero se renderiza vertical, hay que rotar
+  video.onloadedmetadata = () => {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    log('Resolución stream: ' + vw + 'x' + vh, 'ok');
+
+    // Si el stream es landscape pero la pantalla está en portrait, rotar
+    if (vw > vh) {
+      // El sensor da horizontal — en portrait necesita rotación
+      const screenPortrait = window.innerHeight > window.innerWidth;
+      if (screenPortrait) {
+        video.style.transform = 'rotate(90deg)';
+        video.style.width = '100vh';
+        video.style.height = '100vw';
+        log('Aplicando rotación 90° al preview', 'ok');
+      } else {
+        video.style.transform = '';
+        video.style.width = '';
+        video.style.height = '';
+      }
+    } else {
+      video.style.transform = '';
+      video.style.width = '';
+      video.style.height = '';
+    }
+  };
 }
 
 async function switchCamera() {
@@ -901,51 +945,80 @@ function finishPhotoCapture(n) {
 
 // ── VIDEO CAPTURE ─────────────────────────────────────────
 async function startVideoCapture() {
+  // Destruir mediaRecorder anterior si existe
+  if (mediaRecorder) {
+    if (mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+      // Esperar a que onstop termine antes de continuar
+      await new Promise(r => setTimeout(r, 300));
+    }
+    mediaRecorder = null;
+  }
+  recordedChunks = [];
+
   const durMin = parseInt(document.getElementById('duracion').value);
   const durMs = durMin * 60 * 1000;
-  const calidadVal = document.getElementById('calidad').value;
   const prefix = document.getElementById('filePrefix').value || 'cs';
 
+  log('Preparando grabación de ' + durMin + ' min (' + durMs + 'ms)...', 'ok');
+
   const opts = getBestVideoMime();
-  recordedChunks = [];
 
   try {
     mediaRecorder = new MediaRecorder(stream, opts);
   } catch(e) {
+    log('Codec ' + (opts.mimeType||'?') + ' rechazado, usando defecto', 'err');
     mediaRecorder = new MediaRecorder(stream);
+    opts.mimeType = '';
   }
 
+  // Capturar chunks cada segundo
   mediaRecorder.ondataavailable = e => {
-    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+    if (e.data && e.data.size > 0) {
+      recordedChunks.push(e.data);
+      log('Chunk: ' + (e.data.size/1024).toFixed(1) + 'KB (total chunks: ' + recordedChunks.length + ')', 'ok');
+    }
   };
 
   mediaRecorder.onstop = () => {
+    log('onstop — chunks: ' + recordedChunks.length, 'ok');
+    if (recordedChunks.length === 0) {
+      log('❌ Sin datos grabados', 'err');
+      toast('❌ Error: vídeo sin datos');
+      return;
+    }
     const mimeType = opts.mimeType || 'video/webm';
     const blob = new Blob(recordedChunks, { type: mimeType });
-    const ext = getVideoExt(mimeType);
-    const filename = `${prefix}_${timestamp()}.${ext}`;
-    saveItem({ type: 'video', blob, filename, ts: Date.now() });
-    log('🎥 ' + filename + ' (' + ext.toUpperCase() + ')', 'ok');
-    if (ext === 'webm') {
-      toast('✅ Vídeo guardado (.webm) — ábrelo con VLC');
-      log('⚠️ Android graba webm. Instala VLC para reproducirlo.', 'err');
-    } else {
-      toast('✅ Vídeo guardado (' + durMin + ' min)');
+    log('Blob: ' + (blob.size/1024).toFixed(0) + 'KB', 'ok');
+    if (blob.size < 1024) {
+      log('❌ Blob demasiado pequeño (' + blob.size + ' bytes)', 'err');
+      toast('❌ Vídeo vacío — intenta de nuevo');
+      return;
     }
+    const ext = getVideoExt(mimeType);
+    const filename = prefix + '_' + timestamp() + '.' + ext;
+    saveItem({ type: 'video', blob, filename, ts: Date.now() });
+    log('🎥 ' + filename + ' (' + (blob.size/1024/1024).toFixed(2) + 'MB)', 'ok');
+    toast('✅ Vídeo guardado — ábrelo con VLC si es .webm');
     renderGallery();
   };
 
+  mediaRecorder.onerror = e => {
+    log('❌ MediaRecorder error: ' + e.error?.message, 'err');
+    toast('❌ Error grabando: ' + e.error?.message);
+  };
+
   mediaRecorder.start(1000);
-  log('Grabando vídeo por ' + durMin + ' min (' + durMs + 'ms)...', 'ok');
+  log('🔴 Grabando...', 'ok');
+
   document.getElementById('timerDisplay').classList.add('visible');
   document.getElementById('progressWrap').classList.add('visible');
   updateProgress(0, durMs, 'Grabando vídeo...');
   startTimer(durMs);
 
-  // Auto-stop — guardar referencia para poder cancelar
   if (videoTimeout) clearTimeout(videoTimeout);
   videoTimeout = setTimeout(() => {
-    log('Tiempo completado, parando...', 'ok');
+    log('⏱ Tiempo completado — parando automáticamente', 'ok');
     if (isCapturing) stopCapture();
   }, durMs);
 }
@@ -979,6 +1052,8 @@ let timerStart = 0;
 let timerTotal = 0;
 
 function startTimer(totalMs) {
+  // Limpiar siempre el anterior antes de crear uno nuevo
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
   timerStart = Date.now();
   timerTotal = totalMs;
   timerInterval = setInterval(() => {
